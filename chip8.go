@@ -46,12 +46,18 @@ var R_PC uint16
 // - In the draw instruction VF is set upon pixel collision
 var R_V [16]uint8
 
-func read_hbyte(value uint16, position int) uint16 {
-	return value >> (max(min(position, 0), 3) * 4)
+func read_hbyte(value uint16, position int) uint8 {
+	position = min(max(position, 0), 3)
+	return uint8((value >> (position * 4)) & 0x000f)
 }
 
-func read_byte(value uint16, position int) uint16 {
-	return value >> (max(min(position, 0), 1) * 8)
+func read_byte(value uint16, position int) uint8 {
+	position = min(max(position, 0), 1)
+	return uint8(value >> (position * 8))
+}
+
+func next(pc *uint16) {
+	*pc += 2
 }
 
 func main() {
@@ -132,7 +138,7 @@ func main() {
 	for {
 		// fetch
 		instruction := (uint16(mem[R_PC]) << 8) | uint16(mem[R_PC+1])
-		R_PC += 2
+		next(&R_PC)
 
 		// instruction:
 		//            b1                      b0
@@ -140,13 +146,18 @@ func main() {
 		// 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
 		// |---------| |---------|  |--------|  |--------|
 		//     h3  			h2          h1          h0
-		_, b0 := read_byte(instruction, 1), read_byte(instruction, 0)
+		b1, b0 := read_byte(instruction, 1), read_byte(instruction, 0)
 
-		h3, _, _, h0 :=
+		h3, h2, h1, h0 :=
 			read_hbyte(instruction, 3),
 			read_hbyte(instruction, 2),
 			read_hbyte(instruction, 1),
 			read_hbyte(instruction, 0)
+
+		if IS_DEBUG {
+			fmt.Printf("%02x -> b1: %2x, b0: %02x\n", instruction, b1, b0)
+			fmt.Printf("%02x -> h3: %01x, h2: %01x, h1: %01x, h0: %01x\n", instruction, h3, h2, h1, h0)
+		}
 
 		if instruction == 0x00E0 {
 			// 00E0
@@ -154,7 +165,7 @@ func main() {
 		} else if instruction == 0x00EE {
 			// 00E0
 
-		} else if h3 == 0x0 {
+		} else if instruction != 0 && h3 == 0x0 {
 			// 0NNN
 
 		} else if h3 == 0x1 {
@@ -165,6 +176,11 @@ func main() {
 
 		} else if h3 == 0x3 {
 			// 3XNN
+			NN := b0
+			VX := R_V[h3]
+			if VX == NN {
+				next(&R_PC)
+			}
 
 		} else if h3 == 0x4 {
 			// 4XNN
@@ -230,30 +246,33 @@ func main() {
 			// FX0A
 
 		} else if h3 == 0xF && b0 == 0x0A {
-			// FX1E
+			// FX0A
 
 		} else if h3 == 0xF && b0 == 0x1E {
-			// FX07
+			// FX1E
 
 		} else if h3 == 0xF && b0 == 0x07 {
-			// FX15
+			// FX07
 
 		} else if h3 == 0xF && b0 == 0x15 {
-			// FX18
+			// FX15
 
 		} else if h3 == 0xF && b0 == 0x18 {
-			// FX29
+			// FX18
 
 		} else if h3 == 0xF && b0 == 0x29 {
-			// FX33
+			// FX29
 
 		} else if h3 == 0xF && b0 == 0x33 {
-			// FX55
+			// FX33
 
 		} else if h3 == 0xF && b0 == 0x55 {
-			// FX65
+			// FX55
 
 		} else if h3 == 0xF && b0 == 0x65 {
+			// FX65
+
+		} else {
 			panic("Incorrect opcode!")
 		}
 	}
