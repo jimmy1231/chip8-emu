@@ -46,6 +46,8 @@ var R_PC uint16
 // - In the draw instruction VF is set upon pixel collision
 var R_V [16]uint8
 
+const INDEX_VF = 15
+
 func read_hbyte(value uint16, position int) uint8 {
 	position = min(max(position, 0), 3)
 	return uint8((value >> (position * 4)) & 0x000f)
@@ -138,6 +140,7 @@ func main() {
 	for {
 		// fetch
 		instruction := (uint16(mem[R_PC]) << 8) | uint16(mem[R_PC+1])
+		instruction = 0x8235
 		next(&R_PC)
 
 		// instruction:
@@ -177,40 +180,82 @@ func main() {
 		} else if h3 == 0x3 {
 			// 3XNN
 			NN := b0
-			VX := R_V[h3]
+			VX := R_V[h2]
 			if VX == NN {
 				next(&R_PC)
 			}
 
 		} else if h3 == 0x4 {
 			// 4XNN
+			NN := b0
+			VX := R_V[h2]
+			if VX != NN {
+				next(&R_PC)
+			}
 
 		} else if h3 == 0x5 {
 			// 5XY0
+			VX := R_V[h2]
+			VY := R_V[h1]
+			if VX == VY {
+				next(&R_PC)
+			}
 
 		} else if h3 == 0x6 {
 			// 6XNN
+			R_V[h2] = b0
 
 		} else if h3 == 0x7 {
 			// 7XNN
+			R_V[h2] += b0
 
 		} else if h3 == 0x8 && h0 == 0x0 {
 			// 8XY0
+			R_V[h2] = R_V[h1]
 
 		} else if h3 == 0x8 && h0 == 0x1 {
 			// 8XY1
+			R_V[h2] |= R_V[h1]
 
 		} else if h3 == 0x8 && h0 == 0x2 {
 			// 8XY2
+			R_V[h2] &= R_V[h1]
 
 		} else if h3 == 0x8 && h0 == 0x3 {
 			// 8XY3
+			R_V[h2] ^= R_V[h1]
 
 		} else if h3 == 0x8 && h0 == 0x4 {
 			// 8XY4
+			VX := &R_V[h2]
+			VY := &R_V[h1]
+			result := uint16(*VX) + uint16(*VY)
+
+			// check for uint8 overflow
+			if result > 0xff {
+				// set VF to 1 to indicate carryover
+				R_V[INDEX_VF] = 1
+			}
+
+			*VX = uint8(result)
 
 		} else if h3 == 0x8 && h0 == 0x5 {
 			// 8XY5
+			VX := &R_V[h2]
+			VY := &R_V[h1]
+			*VX = 100
+			*VY = 120
+			VF := &R_V[INDEX_VF]
+
+			// set VF to 1 if no underflow
+			if *VX < *VY {
+				*VF = 0
+			} else {
+				*VF = 1
+			}
+
+			*VX -= *VY
+			fmt.Printf("SUBTRACT: vx: %d, vy: %d, vf: %d\n", *VX, *VY, *VF)
 
 		} else if h3 == 0x8 && h0 == 0x6 {
 			// 8XY6
