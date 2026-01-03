@@ -12,11 +12,11 @@ x init memory
 x load program into memory
 x load fonts
 
-FDE
+x FDE
 clock speed
 timing registers
 
-benchmark: IBM logo
+x benchmark: IBM logo
 
 IO - sound, keypress, display
 */
@@ -24,15 +24,16 @@ IO - sound, keypress, display
 const SIZE_ADDR = 4096
 
 // TODO: make this an input
-const PROGRAM = "roms/zero-demo.ch8"
+const PROGRAM = "roms/ibm.ch8"
 
-const ADDR_PROGRAM_START = 0x1FF
+const ADDR_PROGRAM_START = 0x200
 const ADDR_FONT_START = 0x050
 const ADDR_FONT_END = 0x09F
 const ADDR_DISPLAY_START = 0xf00
 
 const DISPLAY_WIDTH = uint8(64)
 const DISPLAY_HEIGHT = uint8(32)
+const SPRITE_WIDTH = uint8(8)
 
 const IS_DEBUG = true
 
@@ -107,17 +108,18 @@ func get_bit(b uint8, offset uint8) uint8 {
 	return (b >> offset) & 0x1
 }
 
-func get_display_addr(x uint8, y uint8) (uint8, uint8) {
-	return (x / 8) * y, uint8(x % 8)
+// x, y, w: in pixels
+func get_display_addr(x uint8, y uint8, w uint8) (uint8, uint8) {
+	return y*(w/8) + x/8, 7 - uint8(x%8)
 }
 
-func get_pixel(m []uint8, x uint8, y uint8) uint8 {
-	addr, offset := get_display_addr(x, y)
+func get_pixel(m []uint8, x uint8, y uint8, w uint8) uint8 {
+	addr, offset := get_display_addr(x, y, w)
 	return get_bit(m[addr], offset)
 }
 
-func set_pixel(m []uint8, x uint8, y uint8, value bool) {
-	addr, offset := get_display_addr(x, y)
+func set_pixel(m []uint8, x uint8, y uint8, w uint8, value bool) {
+	addr, offset := get_display_addr(x, y, w)
 	if !value {
 		// unset
 		m[addr] &= ^(uint8(1) << offset)
@@ -172,43 +174,61 @@ func draw(mem []uint8, start_x uint8, start_y uint8, height uint8, sprite_addr u
 	*/
 	display := mem[ADDR_DISPLAY_START:]
 	sprite := mem[sprite_addr : sprite_addr+uint16(height)]
+	start_x = start_x % DISPLAY_WIDTH
+	start_y = start_y % DISPLAY_HEIGHT
+
+	if IS_DEBUG {
+		fmt.Println(sprite)
+		print_bitmap(sprite, SPRITE_WIDTH, height)
+		fmt.Printf("Drawing at (%d, %d) h=%d. Sprite_addr=0x%02x\n", start_x, start_y, height, sprite_addr)
+	}
 
 	is_collision := false
 
-	for y := start_y; y < start_y+height; y++ {
-		for x := start_x; x < start_x+8; x++ {
-			display_pixel := get_pixel(display, x, y)
-			sprite_pixel := get_pixel(sprite, x-start_x, y-start_y)
+	x_s := uint8(0)
+	y_s := height - 1
+
+	for y := start_y; y < min(start_y+height, DISPLAY_HEIGHT); y++ {
+		for x := start_x; x < min(start_x+8, DISPLAY_WIDTH); x++ {
+			display_pixel := get_pixel(display, x, y, DISPLAY_WIDTH)
+
+			addr, offset := get_display_addr(x_s, y_s, SPRITE_WIDTH)
+			sprite_pixel := get_bit(sprite[addr], offset)
 
 			// only modify display pixel if sprite pixel is set
 			if sprite_pixel == 0x1 {
 				if display_pixel == 0x1 {
-					set_pixel(display, x, y, false)
+					set_pixel(display, x, y, DISPLAY_WIDTH, false)
 					is_collision = true
 				} else {
 					// set display pixel
-					set_pixel(display, x, y, true)
+					set_pixel(display, x, y, DISPLAY_WIDTH, true)
 				}
 			}
+
+			// if IS_DEBUG {
+			// 	fmt.Printf("(%d, %d): %d -> %d = %d\n",
+			// 		x, y,
+			// 		display_pixel, sprite_pixel,
+			// 		get_pixel(display, x, y, DISPLAY_WIDTH))
+			// }
+			x_s++
 		}
+
+		x_s = 0
+		y_s--
 	}
 
-	disp_print(mem)
+	print_bitmap(display, DISPLAY_WIDTH, DISPLAY_HEIGHT)
 	return is_collision
 }
 
-func disp_print(mem []uint8) {
-	if !IS_DEBUG {
-		return
-	}
-
-	display := mem[ADDR_DISPLAY_START:]
-
-	fmt.Println("------------- print display -------------")
-	for y := int(DISPLAY_HEIGHT) - 1; y >= 0; y-- {
+func print_bitmap(bm []uint8, w uint8, h uint8) {
+	fmt.Println("------------- print -------------")
+	for y := int(h) - 1; y >= 0; y-- {
 		fmt.Printf("%d:\t", y)
-		for x := range DISPLAY_WIDTH {
-			display_pixel := get_pixel(display, x, uint8(y))
+		for x := range w {
+			display_pixel := get_pixel(bm, x, uint8(y), w)
 			if display_pixel == 0x1 {
 				fmt.Print(" * ")
 			} else {
@@ -218,10 +238,10 @@ func disp_print(mem []uint8) {
 		fmt.Printf("\n")
 	}
 	fmt.Print("\t")
-	for x := range DISPLAY_WIDTH {
+	for x := range w {
 		fmt.Printf("%02d ", x)
 	}
-	fmt.Println("\n------------- end print display -------------")
+	fmt.Println("\n------------- end print -------------")
 }
 
 func disp_clear(mem []uint8) {
@@ -333,7 +353,7 @@ func main() {
 		//     h3  			h2          h1          h0
 		//             |---------------------------------|
 		//                             NNN
-		b1, b0 := read_byte(instruction, 1), read_byte(instruction, 0)
+		_, b0 := read_byte(instruction, 1), read_byte(instruction, 0)
 		NNN := instruction & 0x0fff
 
 		h3, h2, h1, h0 :=
@@ -343,8 +363,7 @@ func main() {
 			read_hbyte(instruction, 0)
 
 		if IS_DEBUG {
-			fmt.Printf("%02x -> b1: %2x, b0: %02x\n", instruction, b1, b0)
-			fmt.Printf("%02x -> h3: %01x, h2: %01x, h1: %01x, h0: %01x\n", instruction, h3, h2, h1, h0)
+			fmt.Printf("0x%04x:\n", instruction)
 		}
 
 		if instruction == 0x00E0 {
@@ -367,6 +386,9 @@ func main() {
 
 		} else if h3 == 0x2 {
 			// 2NNN
+			if IS_DEBUG {
+				fmt.Printf("Calling subroutine at 0x%03x\n", NNN)
+			}
 			stack_push(mem, &SP, R_PC)
 			R_PC = NNN
 
@@ -396,11 +418,25 @@ func main() {
 
 		} else if h3 == 0x6 {
 			// 6XNN
-			R_V[h2] = b0
+			VX := &R_V[h2]
+			NN := b0
+
+			if IS_DEBUG {
+				fmt.Printf("Set V%d to %d\n", h2, NN)
+			}
+
+			*VX = NN
 
 		} else if h3 == 0x7 {
 			// 7XNN
-			R_V[h2] += b0
+			VX := &R_V[h2]
+			NN := b0
+
+			if IS_DEBUG {
+				fmt.Printf("Add V%d to %d. V%d=%d\n", h2, NN, h2, *VX)
+			}
+
+			*VX += NN
 
 		} else if h3 == 0x8 && h0 == 0x0 {
 			// 8XY0
@@ -493,6 +529,9 @@ func main() {
 
 		} else if h3 == 0xA {
 			// ANNN
+			if IS_DEBUG {
+				fmt.Printf("Set I to 0x%x\n", NNN)
+			}
 			R_I = NNN
 
 		} else if h3 == 0xB {
@@ -589,7 +628,16 @@ func main() {
 			copy(R_V[:*VX+1], mem[R_I:])
 
 		} else {
-			panic("Incorrect opcode!")
+			break
+		}
+
+		if IS_DEBUG {
+			fmt.Printf("I=0x%03x, PC=0x%03x, SP=0x%03x\n", R_I, R_PC, SP)
+			for i := range len(R_V) - 1 {
+				fmt.Printf("V%d=%d, ", i, R_V[i])
+			}
+			fmt.Printf("VF=%d\n", R_V[15])
+			fmt.Println("-------------------------")
 		}
 	}
 }
