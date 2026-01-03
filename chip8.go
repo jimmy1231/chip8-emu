@@ -5,6 +5,8 @@ import (
 	"io"
 	"math/rand/v2"
 	"os"
+	"sync"
+	"time"
 )
 
 /*
@@ -14,11 +16,13 @@ x load fonts
 
 x FDE
 clock speed
-timing registers
 
 x benchmark: IBM logo
 
-IO - sound, keypress, display
+IO
+- timers (sound, delay)
+- keyboard (0 - F)
+- display
 */
 
 const SIZE_ADDR = 4096
@@ -34,8 +38,11 @@ const ADDR_DISPLAY_START = 0xf00
 const DISPLAY_WIDTH = uint8(64)
 const DISPLAY_HEIGHT = uint8(32)
 const SPRITE_WIDTH = uint8(8)
+const INVALID_KEY = 0xff
 
-const IS_DEBUG = true
+const IS_DEBUG = false
+const REFRESH_RATE = 16 * time.Millisecond
+const CLOCK_SPEED = 2 * time.Millisecond
 
 // == registers ==
 // index register: points to location in memory
@@ -57,7 +64,27 @@ var SP uint16
 const INDEX_VF = 15
 
 // hardware
-var PRESSED_KEY uint8
+var PRESSED_KEY uint8 = INVALID_KEY
+var TIMER_DELAY uint8
+var TIMER_SOUND uint8
+
+type Timer struct {
+	mu     sync.Mutex
+	v      uint8
+	ticker *time.Ticker
+	c      chan bool
+}
+
+func (t Timer) stop() {
+	t.ticker.Stop()
+	t.c <- true
+}
+
+func (t Timer) set_value(v uint8) {
+	t.mu.Lock()
+	t.v = v
+	t.mu.Unlock()
+}
 
 func read_hbyte(value uint16, position int) uint8 {
 	position = min(max(position, 0), 3)
@@ -82,22 +109,15 @@ func key() uint8 {
 }
 
 // blocks until key is pressed
+// if keyboard thread sets the key, this function will return
 func get_key() uint8 {
-	// TODO
-	return 0x0
-}
+	// do..while
+	k := key()
+	for k == INVALID_KEY {
+		k = key()
+	}
 
-func get_delay() uint8 {
-	// TODO
-	return 0x0
-}
-
-func set_delay(value uint8) {
-	// TODO
-}
-
-func set_sound(value uint8) {
-	// TODO
+	return k
 }
 
 func font_addr(c uint8) uint16 {
@@ -174,26 +194,28 @@ func draw(mem []uint8, start_x uint8, start_y uint8, height uint8, sprite_addr u
 	*/
 	display := mem[ADDR_DISPLAY_START:]
 	sprite := mem[sprite_addr : sprite_addr+uint16(height)]
+
 	start_x = start_x % DISPLAY_WIDTH
 	start_y = start_y % DISPLAY_HEIGHT
 
 	if IS_DEBUG {
 		fmt.Println(sprite)
 		print_bitmap(sprite, SPRITE_WIDTH, height)
-		fmt.Printf("Drawing at (%d, %d) h=%d. Sprite_addr=0x%02x\n", start_x, start_y, height, sprite_addr)
+		fmt.Printf("Drawing at (%d, %d) h=%d. Sprite_addr=0x%02x\n",
+			start_x, start_y,
+			height,
+			sprite_addr)
 	}
 
 	is_collision := false
 
-	x_s := uint8(0)
-	y_s := height - 1
+	Y := min(start_y+height, DISPLAY_HEIGHT)
+	X := min(start_x+8, DISPLAY_WIDTH)
 
-	for y := start_y; y < min(start_y+height, DISPLAY_HEIGHT); y++ {
-		for x := start_x; x < min(start_x+8, DISPLAY_WIDTH); x++ {
+	for y := start_y; y < Y; y++ {
+		for x := start_x; x < X; x++ {
 			display_pixel := get_pixel(display, x, y, DISPLAY_WIDTH)
-
-			addr, offset := get_display_addr(x_s, y_s, SPRITE_WIDTH)
-			sprite_pixel := get_bit(sprite[addr], offset)
+			sprite_pixel := get_pixel(sprite, x-start_x, y-start_y, SPRITE_WIDTH)
 
 			// only modify display pixel if sprite pixel is set
 			if sprite_pixel == 0x1 {
@@ -205,18 +227,7 @@ func draw(mem []uint8, start_x uint8, start_y uint8, height uint8, sprite_addr u
 					set_pixel(display, x, y, DISPLAY_WIDTH, true)
 				}
 			}
-
-			// if IS_DEBUG {
-			// 	fmt.Printf("(%d, %d): %d -> %d = %d\n",
-			// 		x, y,
-			// 		display_pixel, sprite_pixel,
-			// 		get_pixel(display, x, y, DISPLAY_WIDTH))
-			// }
-			x_s++
 		}
-
-		x_s = 0
-		y_s--
 	}
 
 	print_bitmap(display, DISPLAY_WIDTH, DISPLAY_HEIGHT)
@@ -224,9 +235,13 @@ func draw(mem []uint8, start_x uint8, start_y uint8, height uint8, sprite_addr u
 }
 
 func print_bitmap(bm []uint8, w uint8, h uint8) {
-	fmt.Println("------------- print -------------")
-	for y := int(h) - 1; y >= 0; y-- {
-		fmt.Printf("%d:\t", y)
+	fmt.Print("\t")
+	for x := range w {
+		fmt.Printf("%02d ", x)
+	}
+	fmt.Print("\n")
+	for y := 0; y < int(h); y++ {
+		fmt.Printf("%02d\t", y)
 		for x := range w {
 			display_pixel := get_pixel(bm, x, uint8(y), w)
 			if display_pixel == 0x1 {
@@ -237,11 +252,6 @@ func print_bitmap(bm []uint8, w uint8, h uint8) {
 		}
 		fmt.Printf("\n")
 	}
-	fmt.Print("\t")
-	for x := range w {
-		fmt.Printf("%02d ", x)
-	}
-	fmt.Println("\n------------- end print -------------")
 }
 
 func disp_clear(mem []uint8) {
@@ -265,6 +275,311 @@ func stack_pop(mem []uint8, sp *uint16) uint16 {
 	return (uint16(b1) << 8) | uint16(b0)
 }
 
+// fetch, decode, execute handler
+func fde(mem []uint8, sound *Timer, delay *Timer) bool {
+	// fetch
+	instruction := (uint16(mem[R_PC]) << 8) | uint16(mem[R_PC+1])
+	next(&R_PC)
+
+	// instruction:
+	//            b1                      b0
+	// |---------------------|  |--------------------|
+	// 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+	// |---------| |---------|  |--------|  |--------|
+	//     h3  			h2          h1          h0
+	//             |---------------------------------|
+	//                             NNN
+	_, b0 := read_byte(instruction, 1), read_byte(instruction, 0)
+	NNN := instruction & 0x0fff
+
+	h3, h2, h1, h0 :=
+		read_hbyte(instruction, 3),
+		read_hbyte(instruction, 2),
+		read_hbyte(instruction, 1),
+		read_hbyte(instruction, 0)
+
+	if IS_DEBUG {
+		fmt.Printf("0x%04x:\n", instruction)
+	}
+
+	if instruction == 0x00E0 {
+		// 00E0
+		disp_clear(mem)
+
+	} else if instruction == 0x00EE {
+		// 00E0
+		R_PC = stack_pop(mem, &SP)
+
+	} else if instruction != 0 && h3 == 0x0 {
+		// 0NNN
+		// set return addr to next instruction
+		stack_push(mem, &SP, R_PC)
+		R_PC = NNN
+
+	} else if h3 == 0x1 {
+		// 1NNN
+		R_PC = NNN
+
+	} else if h3 == 0x2 {
+		// 2NNN
+		if IS_DEBUG {
+			fmt.Printf("Calling subroutine at 0x%03x\n", NNN)
+		}
+		stack_push(mem, &SP, R_PC)
+		R_PC = NNN
+
+	} else if h3 == 0x3 {
+		// 3XNN
+		NN := b0
+		VX := R_V[h2]
+		if VX == NN {
+			next(&R_PC)
+		}
+
+	} else if h3 == 0x4 {
+		// 4XNN
+		NN := b0
+		VX := R_V[h2]
+		if VX != NN {
+			next(&R_PC)
+		}
+
+	} else if h3 == 0x5 {
+		// 5XY0
+		VX := R_V[h2]
+		VY := R_V[h1]
+		if VX == VY {
+			next(&R_PC)
+		}
+
+	} else if h3 == 0x6 {
+		// 6XNN
+		VX := &R_V[h2]
+		NN := b0
+
+		if IS_DEBUG {
+			fmt.Printf("Set V%d to %d\n", h2, NN)
+		}
+
+		*VX = NN
+
+	} else if h3 == 0x7 {
+		// 7XNN
+		VX := &R_V[h2]
+		NN := b0
+
+		if IS_DEBUG {
+			fmt.Printf("Add V%d to %d. V%d=%d\n", h2, NN, h2, *VX)
+		}
+
+		*VX += NN
+
+	} else if h3 == 0x8 && h0 == 0x0 {
+		// 8XY0
+		R_V[h2] = R_V[h1]
+
+	} else if h3 == 0x8 && h0 == 0x1 {
+		// 8XY1
+		R_V[h2] |= R_V[h1]
+
+	} else if h3 == 0x8 && h0 == 0x2 {
+		// 8XY2
+		R_V[h2] &= R_V[h1]
+
+	} else if h3 == 0x8 && h0 == 0x3 {
+		// 8XY3
+		R_V[h2] ^= R_V[h1]
+
+	} else if h3 == 0x8 && h0 == 0x4 {
+		// 8XY4
+		VX := &R_V[h2]
+		VY := &R_V[h1]
+		result := uint16(*VX) + uint16(*VY)
+
+		// check for uint8 overflow
+		if result > 0xff {
+			// set VF to 1 to indicate carryover
+			R_V[INDEX_VF] = 1
+		}
+
+		*VX = uint8(result)
+
+	} else if h3 == 0x8 && h0 == 0x5 {
+		// 8XY5
+		VX := &R_V[h2]
+		VY := &R_V[h1]
+		VF := &R_V[INDEX_VF]
+
+		// set VF to 1 if no underflow
+		if *VX < *VY {
+			*VF = 0
+		} else {
+			*VF = 1
+		}
+
+		*VX -= *VY
+		fmt.Printf("SUBTRACT: vx: %d, vy: %d, vf: %d\n", *VX, *VY, *VF)
+
+	} else if h3 == 0x8 && h0 == 0x6 {
+		// 8XY6
+		VX := &R_V[h2]
+		VY := &R_V[h1]
+		VF := &R_V[INDEX_VF]
+
+		*VX = *VY
+		*VF = *VX & 0x1
+		*VX >>= 1
+
+	} else if h3 == 0x8 && h0 == 0x7 {
+		// 8XY7
+		VX := &R_V[h2]
+		VY := &R_V[h1]
+		VF := &R_V[INDEX_VF]
+
+		if *VY >= *VX {
+			*VF = 1
+		} else {
+			*VF = 0
+		}
+
+		*VX = *VY - *VX
+
+	} else if h3 == 0x8 && h0 == 0xE {
+		// 8XYE
+		VX := &R_V[h2]
+		VY := &R_V[h1]
+		VF := &R_V[INDEX_VF]
+
+		*VX = *VY
+		*VF = (*VX >> 7) & 0x1
+		*VX <<= 1
+
+	} else if h3 == 0x9 {
+		// 9XY0
+		VX := &R_V[h2]
+		VY := &R_V[h1]
+
+		if *VX != *VY {
+			next(&R_PC)
+		}
+
+	} else if h3 == 0xA {
+		// ANNN
+		if IS_DEBUG {
+			fmt.Printf("Set I to 0x%x\n", NNN)
+		}
+		R_I = NNN
+
+	} else if h3 == 0xB {
+		// BNNN
+		R_PC = uint16(R_V[0]) + NNN
+
+	} else if h3 == 0xC {
+		// CXNN
+		VX := &R_V[h2]
+		NN := b0
+
+		*VX = uint8(rand.IntN(255)) & NN
+
+	} else if h3 == 0xD {
+		// DXYN
+		VX := &R_V[h2]
+		VY := &R_V[h1]
+		VF := &R_V[INDEX_VF]
+		N := h0
+
+		is_collision := draw(mem, *VX, *VY, N, R_I)
+		if is_collision {
+			*VF = 1
+		} else {
+			*VF = 0
+		}
+
+	} else if h3 == 0xE && b0 == 0x9E {
+		// EX9E
+		VX := &R_V[h2]
+
+		if key() == *VX {
+			next(&R_PC)
+		}
+
+	} else if h3 == 0xE && b0 == 0xA1 {
+		// EXA1
+		VX := &R_V[h2]
+
+		if key() != *VX {
+			next(&R_PC)
+		}
+
+	} else if h3 == 0xF && b0 == 0x0A {
+		// FX0A
+		VX := &R_V[h2]
+		*VX = get_key()
+
+	} else if h3 == 0xF && b0 == 0x1E {
+		// FX1E
+		VX := &R_V[h2]
+		R_I += uint16(*VX)
+
+	} else if h3 == 0xF && b0 == 0x07 {
+		// FX07
+		VX := &R_V[h2]
+		*VX = delay.v
+
+	} else if h3 == 0xF && b0 == 0x15 {
+		// FX15
+		VX := &R_V[h2]
+		delay.set_value(*VX)
+
+	} else if h3 == 0xF && b0 == 0x18 {
+		// FX18
+		VX := &R_V[h2]
+		sound.set_value(*VX)
+
+	} else if h3 == 0xF && b0 == 0x29 {
+		// FX29
+		VX := &R_V[h2]
+		R_I = font_addr(*VX)
+
+	} else if h3 == 0xF && b0 == 0x33 {
+		// FX33
+		VX := &R_V[h2]
+
+		hundreds := *VX / 100
+		tens := (*VX % 100) / 10
+		ones := *VX % 10
+
+		mem[R_I] = hundreds
+		mem[R_I+1] = tens
+		mem[R_I+2] = ones
+
+	} else if h3 == 0xF && b0 == 0x55 {
+		// FX55
+		VX := &R_V[h2]
+		copy(mem[R_I:], R_V[:*VX+1])
+
+	} else if h3 == 0xF && b0 == 0x65 {
+		// FX65
+		VX := &R_V[h2]
+		copy(R_V[:*VX+1], mem[R_I:])
+
+	} else {
+		fmt.Println("GAME ENDED!")
+		return false
+	}
+
+	if IS_DEBUG {
+		fmt.Printf("I=0x%03x, PC=0x%03x, SP=0x%03x\n", R_I, R_PC, SP)
+		for i := range len(R_V) - 1 {
+			fmt.Printf("V%d=%d, ", i, R_V[i])
+		}
+		fmt.Printf("VF=%d\n", R_V[15])
+		fmt.Println("-------------------------")
+	}
+
+	return true
+}
+
 func main() {
 	mem := make([]uint8, SIZE_ADDR)
 
@@ -279,6 +594,47 @@ func main() {
 			panic(err)
 		}
 	}()
+
+	// sound timer
+	sound := Timer{ticker: time.NewTicker(REFRESH_RATE), c: make(chan bool)}
+	go func() {
+		for {
+			select {
+			case <-sound.c:
+				return
+			case t := <-sound.ticker.C:
+				if IS_DEBUG {
+					fmt.Println("Sound tick at", t)
+				}
+				sound.mu.Lock()
+				sound.v = max(sound.v-1, 0)
+				if sound.v != 0 {
+					// TODO make a BEEP sound!!
+				}
+				sound.mu.Unlock()
+			}
+		}
+	}()
+
+	// delay timer
+	delay := Timer{ticker: time.NewTicker(REFRESH_RATE), c: make(chan bool)}
+	go func() {
+		for {
+			select {
+			case <-delay.c:
+				return
+			case t := <-delay.ticker.C:
+				if IS_DEBUG {
+					fmt.Println("Delay tick at", t)
+				}
+				delay.mu.Lock()
+				delay.v = max(delay.v-1, 0)
+				delay.mu.Unlock()
+			}
+		}
+	}()
+
+	// keyboard -- TODO: need graphics library & I/O
 
 	print_mem := func() {
 		if !IS_DEBUG {
@@ -340,304 +696,29 @@ func main() {
 	print_mem()
 
 	R_PC = ADDR_PROGRAM_START
-	for {
-		// fetch
-		instruction := (uint16(mem[R_PC]) << 8) | uint16(mem[R_PC+1])
-		next(&R_PC)
 
-		// instruction:
-		//            b1                      b0
-		// |---------------------|  |--------------------|
-		// 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
-		// |---------| |---------|  |--------|  |--------|
-		//     h3  			h2          h1          h0
-		//             |---------------------------------|
-		//                             NNN
-		_, b0 := read_byte(instruction, 1), read_byte(instruction, 0)
-		NNN := instruction & 0x0fff
-
-		h3, h2, h1, h0 :=
-			read_hbyte(instruction, 3),
-			read_hbyte(instruction, 2),
-			read_hbyte(instruction, 1),
-			read_hbyte(instruction, 0)
-
-		if IS_DEBUG {
-			fmt.Printf("0x%04x:\n", instruction)
+	// simulate ~700 instructions per second
+	main_loop := Timer{ticker: time.NewTicker(CLOCK_SPEED), c: make(chan bool)}
+	go func() {
+		for {
+			select {
+			case <-main_loop.c:
+				return
+			case t := <-main_loop.ticker.C:
+				if IS_DEBUG {
+					fmt.Println("Main loop tick at", t)
+				}
+				if !fde(mem, &sound, &delay) {
+					main_loop.stop()
+				}
+			}
 		}
+	}()
 
-		if instruction == 0x00E0 {
-			// 00E0
-			disp_clear(mem)
-
-		} else if instruction == 0x00EE {
-			// 00E0
-			R_PC = stack_pop(mem, &SP)
-
-		} else if instruction != 0 && h3 == 0x0 {
-			// 0NNN
-			// set return addr to next instruction
-			stack_push(mem, &SP, R_PC)
-			R_PC = NNN
-
-		} else if h3 == 0x1 {
-			// 1NNN
-			R_PC = NNN
-
-		} else if h3 == 0x2 {
-			// 2NNN
-			if IS_DEBUG {
-				fmt.Printf("Calling subroutine at 0x%03x\n", NNN)
-			}
-			stack_push(mem, &SP, R_PC)
-			R_PC = NNN
-
-		} else if h3 == 0x3 {
-			// 3XNN
-			NN := b0
-			VX := R_V[h2]
-			if VX == NN {
-				next(&R_PC)
-			}
-
-		} else if h3 == 0x4 {
-			// 4XNN
-			NN := b0
-			VX := R_V[h2]
-			if VX != NN {
-				next(&R_PC)
-			}
-
-		} else if h3 == 0x5 {
-			// 5XY0
-			VX := R_V[h2]
-			VY := R_V[h1]
-			if VX == VY {
-				next(&R_PC)
-			}
-
-		} else if h3 == 0x6 {
-			// 6XNN
-			VX := &R_V[h2]
-			NN := b0
-
-			if IS_DEBUG {
-				fmt.Printf("Set V%d to %d\n", h2, NN)
-			}
-
-			*VX = NN
-
-		} else if h3 == 0x7 {
-			// 7XNN
-			VX := &R_V[h2]
-			NN := b0
-
-			if IS_DEBUG {
-				fmt.Printf("Add V%d to %d. V%d=%d\n", h2, NN, h2, *VX)
-			}
-
-			*VX += NN
-
-		} else if h3 == 0x8 && h0 == 0x0 {
-			// 8XY0
-			R_V[h2] = R_V[h1]
-
-		} else if h3 == 0x8 && h0 == 0x1 {
-			// 8XY1
-			R_V[h2] |= R_V[h1]
-
-		} else if h3 == 0x8 && h0 == 0x2 {
-			// 8XY2
-			R_V[h2] &= R_V[h1]
-
-		} else if h3 == 0x8 && h0 == 0x3 {
-			// 8XY3
-			R_V[h2] ^= R_V[h1]
-
-		} else if h3 == 0x8 && h0 == 0x4 {
-			// 8XY4
-			VX := &R_V[h2]
-			VY := &R_V[h1]
-			result := uint16(*VX) + uint16(*VY)
-
-			// check for uint8 overflow
-			if result > 0xff {
-				// set VF to 1 to indicate carryover
-				R_V[INDEX_VF] = 1
-			}
-
-			*VX = uint8(result)
-
-		} else if h3 == 0x8 && h0 == 0x5 {
-			// 8XY5
-			VX := &R_V[h2]
-			VY := &R_V[h1]
-			VF := &R_V[INDEX_VF]
-
-			// set VF to 1 if no underflow
-			if *VX < *VY {
-				*VF = 0
-			} else {
-				*VF = 1
-			}
-
-			*VX -= *VY
-			fmt.Printf("SUBTRACT: vx: %d, vy: %d, vf: %d\n", *VX, *VY, *VF)
-
-		} else if h3 == 0x8 && h0 == 0x6 {
-			// 8XY6
-			VX := &R_V[h2]
-			VY := &R_V[h1]
-			VF := &R_V[INDEX_VF]
-
-			*VX = *VY
-			*VF = *VX & 0x1
-			*VX >>= 1
-
-		} else if h3 == 0x8 && h0 == 0x7 {
-			// 8XY7
-			VX := &R_V[h2]
-			VY := &R_V[h1]
-			VF := &R_V[INDEX_VF]
-
-			if *VY >= *VX {
-				*VF = 1
-			} else {
-				*VF = 0
-			}
-
-			*VX = *VY - *VX
-
-		} else if h3 == 0x8 && h0 == 0xE {
-			// 8XYE
-			VX := &R_V[h2]
-			VY := &R_V[h1]
-			VF := &R_V[INDEX_VF]
-
-			*VX = *VY
-			*VF = (*VX >> 7) & 0x1
-			*VX <<= 1
-
-		} else if h3 == 0x9 {
-			// 9XY0
-			VX := &R_V[h2]
-			VY := &R_V[h1]
-
-			if *VX != *VY {
-				next(&R_PC)
-			}
-
-		} else if h3 == 0xA {
-			// ANNN
-			if IS_DEBUG {
-				fmt.Printf("Set I to 0x%x\n", NNN)
-			}
-			R_I = NNN
-
-		} else if h3 == 0xB {
-			// BNNN
-			R_PC = uint16(R_V[0]) + NNN
-
-		} else if h3 == 0xC {
-			// CXNN
-			VX := &R_V[h2]
-			NN := b0
-
-			*VX = uint8(rand.IntN(255)) & NN
-
-		} else if h3 == 0xD {
-			// DXYN
-			VX := &R_V[h2]
-			VY := &R_V[h1]
-			VF := &R_V[INDEX_VF]
-			N := h0
-
-			is_collision := draw(mem, *VX, *VY, N, R_I)
-			if is_collision {
-				*VF = 1
-			} else {
-				*VF = 0
-			}
-
-		} else if h3 == 0xE && b0 == 0x9E {
-			// EX9E
-			VX := &R_V[h2]
-
-			if key() == *VX {
-				next(&R_PC)
-			}
-
-		} else if h3 == 0xE && b0 == 0xA1 {
-			// EXA1
-			VX := &R_V[h2]
-
-			if key() != *VX {
-				next(&R_PC)
-			}
-
-		} else if h3 == 0xF && b0 == 0x0A {
-			// FX0A
-			VX := &R_V[h2]
-			*VX = get_key()
-
-		} else if h3 == 0xF && b0 == 0x1E {
-			// FX1E
-			VX := &R_V[h2]
-			R_I += uint16(*VX)
-
-		} else if h3 == 0xF && b0 == 0x07 {
-			// FX07
-			VX := &R_V[h2]
-			*VX = get_delay()
-
-		} else if h3 == 0xF && b0 == 0x15 {
-			// FX15
-			VX := &R_V[h2]
-			set_delay(*VX)
-
-		} else if h3 == 0xF && b0 == 0x18 {
-			// FX18
-			VX := &R_V[h2]
-			set_sound(*VX)
-
-		} else if h3 == 0xF && b0 == 0x29 {
-			// FX29
-			VX := &R_V[h2]
-			R_I = font_addr(*VX)
-
-		} else if h3 == 0xF && b0 == 0x33 {
-			// FX33
-			VX := &R_V[h2]
-
-			hundreds := *VX / 100
-			tens := (*VX % 100) / 10
-			ones := *VX % 10
-
-			mem[R_I] = hundreds
-			mem[R_I+1] = tens
-			mem[R_I+2] = ones
-
-		} else if h3 == 0xF && b0 == 0x55 {
-			// FX55
-			VX := &R_V[h2]
-			copy(mem[R_I:], R_V[:*VX+1])
-
-		} else if h3 == 0xF && b0 == 0x65 {
-			// FX65
-			VX := &R_V[h2]
-			copy(R_V[:*VX+1], mem[R_I:])
-
-		} else {
-			break
-		}
-
-		if IS_DEBUG {
-			fmt.Printf("I=0x%03x, PC=0x%03x, SP=0x%03x\n", R_I, R_PC, SP)
-			for i := range len(R_V) - 1 {
-				fmt.Printf("V%d=%d, ", i, R_V[i])
-			}
-			fmt.Printf("VF=%d\n", R_V[15])
-			fmt.Println("-------------------------")
-		}
+	for !<-main_loop.c {
 	}
+
+	// stop timers, clean up I/O and devices
+	sound.stop()
+	delay.stop()
 }
