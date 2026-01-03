@@ -15,12 +15,12 @@ x load program into memory
 x load fonts
 
 x FDE
-clock speed
+x clock speed
 
 x benchmark: IBM logo
 
 IO
-- timers (sound, delay)
+x - timers (sound, delay)
 - keyboard (0 - F)
 - display
 */
