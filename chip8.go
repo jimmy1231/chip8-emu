@@ -7,6 +7,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/hajimehoshi/ebiten/v2"
 )
 
 /*
@@ -21,14 +23,18 @@ x benchmark: IBM logo
 
 IO
 x - timers (sound, delay)
-- keyboard (0 - F)
-- display
+x - keyboard (0 - F)
+x - display
+
+tests:
+- airplane
+- pong
 */
 
 const SIZE_ADDR = 4096
 
 // TODO: make this an input
-const PROGRAM = "roms/ibm.ch8"
+const PROGRAM = "roms/Airplane.ch8"
 
 const ADDR_PROGRAM_START = 0x200
 const ADDR_FONT_START = 0x050
@@ -43,6 +49,9 @@ const INVALID_KEY = 0xff
 const IS_DEBUG = false
 const REFRESH_RATE = 16 * time.Millisecond
 const CLOCK_SPEED = 2 * time.Millisecond
+
+// 1 pixel in memory = x^2 pixels on screen
+const PIXEL_SIZE = 15
 
 // == registers ==
 // index register: points to location in memory
@@ -86,6 +95,53 @@ func (t Timer) set_value(v uint8) {
 	t.mu.Unlock()
 }
 
+type Game struct {
+	mem []uint8
+}
+
+func (g *Game) Update() error {
+	return nil
+}
+
+func (g *Game) Draw(screen *ebiten.Image) {
+	// TODO: optimize the shit out of this
+	h := int(DISPLAY_HEIGHT)
+	w := int(DISPLAY_WIDTH)
+
+	pixels := make([]byte, 4*h*PIXEL_SIZE*w*PIXEL_SIZE)
+
+	display := g.mem[ADDR_DISPLAY_START:]
+	for y := 0; y < int(h); y++ {
+		for x := range w {
+			display_pixel := get_pixel(display, uint8(x), uint8(y), uint8(w))
+
+			// this looks scary but is actually constant time since PIXEL_SIZE is constant
+			for j := range PIXEL_SIZE {
+				for i := range PIXEL_SIZE {
+					p := ((y*PIXEL_SIZE+j)*w*PIXEL_SIZE + (x*PIXEL_SIZE + i)) * 4
+					if display_pixel == 0x1 {
+						pixels[p] = 0xff
+						pixels[p+1] = 0xff
+						pixels[p+2] = 0xff
+						pixels[p+3] = 0xff
+					} else {
+						pixels[p] = 0
+						pixels[p+1] = 0
+						pixels[p+2] = 0
+						pixels[p+3] = 0
+					}
+				}
+			}
+		}
+	}
+
+	screen.WritePixels(pixels)
+}
+
+func (g *Game) Layout(outsideWidth, outsideHeight int) (screenWidth, screenHeight int) {
+	return int(DISPLAY_WIDTH) * int(PIXEL_SIZE), int(DISPLAY_HEIGHT) * int(PIXEL_SIZE)
+}
+
 func read_hbyte(value uint16, position int) uint8 {
 	position = min(max(position, 0), 3)
 	return uint8((value >> (position * 4)) & 0x000f)
@@ -126,6 +182,10 @@ func font_addr(c uint8) uint16 {
 
 func get_bit(b uint8, offset uint8) uint8 {
 	return (b >> offset) & 0x1
+}
+
+func set_key(k uint8) {
+	PRESSED_KEY = k
 }
 
 // x, y, w: in pixels
@@ -230,7 +290,9 @@ func draw(mem []uint8, start_x uint8, start_y uint8, height uint8, sprite_addr u
 		}
 	}
 
-	print_bitmap(display, DISPLAY_WIDTH, DISPLAY_HEIGHT)
+	if IS_DEBUG {
+		print_bitmap(display, DISPLAY_WIDTH, DISPLAY_HEIGHT)
+	}
 	return is_collision
 }
 
@@ -715,10 +777,65 @@ func main() {
 		}
 	}()
 
-	for !<-main_loop.c {
+	ebiten.SetWindowSize(int(DISPLAY_WIDTH)*PIXEL_SIZE, int(DISPLAY_HEIGHT)*PIXEL_SIZE)
+	ebiten.SetWindowTitle("CHIP-8: " + PROGRAM)
+
+	keypress := Timer{ticker: time.NewTicker(CLOCK_SPEED), c: make(chan bool)}
+	go func() {
+		for {
+			select {
+			case <-keypress.c:
+				return
+			case t := <-keypress.ticker.C:
+				if IS_DEBUG {
+					fmt.Println("keypress loop tick at", t)
+				}
+
+				if ebiten.IsKeyPressed(ebiten.Key0) {
+					set_key(0x0)
+				} else if ebiten.IsKeyPressed(ebiten.Key1) {
+					set_key(0x1)
+				} else if ebiten.IsKeyPressed(ebiten.Key2) {
+					set_key(0x2)
+				} else if ebiten.IsKeyPressed(ebiten.Key3) {
+					set_key(0x3)
+				} else if ebiten.IsKeyPressed(ebiten.Key4) {
+					set_key(0x4)
+				} else if ebiten.IsKeyPressed(ebiten.Key5) {
+					set_key(0x5)
+				} else if ebiten.IsKeyPressed(ebiten.Key6) {
+					set_key(0x6)
+				} else if ebiten.IsKeyPressed(ebiten.Key7) {
+					set_key(0x7)
+				} else if ebiten.IsKeyPressed(ebiten.Key8) {
+					set_key(0x8)
+				} else if ebiten.IsKeyPressed(ebiten.Key9) {
+					set_key(0x9)
+				} else if ebiten.IsKeyPressed(ebiten.KeyA) {
+					set_key(0xA)
+				} else if ebiten.IsKeyPressed(ebiten.KeyB) {
+					set_key(0xB)
+				} else if ebiten.IsKeyPressed(ebiten.KeyC) {
+					set_key(0xC)
+				} else if ebiten.IsKeyPressed(ebiten.KeyD) {
+					set_key(0xD)
+				} else if ebiten.IsKeyPressed(ebiten.KeyE) {
+					set_key(0xE)
+				} else if ebiten.IsKeyPressed(ebiten.KeyF) {
+					set_key(0xF)
+				} else {
+					set_key(INVALID_KEY)
+				}
+			}
+		}
+	}()
+
+	if err := ebiten.RunGame(&Game{mem: mem}); err != nil {
+		panic(err)
 	}
 
 	// stop timers, clean up I/O and devices
 	sound.stop()
 	delay.stop()
+	keypress.stop()
 }
